@@ -9,14 +9,19 @@ import copy
 import numpy as np
 from torchvision import datasets, transforms
 import torch
+from torch.utils.data import DataLoader
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+import keras
 
-from utils.sampling import mnist_iid, mnist_noniid, cifar_iid
+from utils.sampling import mnist_iid, mnist_noniid, cifar_iid, cifar_noniid
 from utils.options import args_parser
 from models.Update import LocalUpdate
 from models.Nets import MLP, CNNMnist, CNNCifar
 from models.Fed import FedAvg
 from models.test import test_img
 
+# keras.backend.set_image_data_format("channels_first")
 
 if __name__ == '__main__':
     # parse args
@@ -40,10 +45,43 @@ if __name__ == '__main__':
         if args.iid:
             dict_users = cifar_iid(dataset_train, args.num_users)
         else:
-            exit('Error: only consider IID setting in CIFAR10')
+            dict_users = cifar_noniid(dataset_train, args.num_users)
     else:
         exit('Error: unrecognized dataset')
     img_size = dataset_train[0][0].shape
+
+
+    if args.num_clusters > 0:
+        print('Featuring...')
+        input_shape = (img_size[1], img_size[2], img_size[0])
+        user_feats = []
+        for idx_user in dict_users:
+            print('User', idx_user, 'featuring...')
+            user_images = [dataset_train[idx][0].numpy().swapaxes(0, 1).swapaxes(1, 2) for idx in dict_users[idx_user]]
+            model1 = keras.applications.vgg19.VGG19(include_top=False, weights="imagenet", input_shape=input_shape)
+            pred = model1.predict([user_images])
+            feats = np.mean([data[0][0] for data in pred], axis=0)
+            user_feats.append(feats)
+            
+        # 适当降维
+        print('PCA...')
+        pca = PCA(n_components=100, random_state=728)
+        pca_users = pca.fit_transform(user_feats)
+
+        # 聚类 users
+        print('Clustering...')
+        kmeans = KMeans(n_clusters=args.num_clusters, random_state=728)
+        kmeans.fit(pca_users)
+
+        dict_clusters = {}
+        for idx_user, label in enumerate(kmeans.labels_):
+            if label in dict_clusters:
+                dict_clusters[label].append(idx_user)
+            else:
+                dict_clusters[label] = [idx_user]
+        print('Clustering finished.')
+        print('Dict of cluster - users: ', dict_clusters)
+
 
     # build model
     if args.model == 'cnn' and args.dataset == 'cifar':
@@ -73,8 +111,16 @@ if __name__ == '__main__':
 
     for iter in range(args.epochs):
         w_locals, loss_locals = [], []
-        m = max(int(args.frac * args.num_users), 1)
-        idxs_users = np.random.choice(range(args.num_users), m, replace=False)
+
+        if args.num_clusters > 0:
+            # 预先聚类的情况
+            idxs_users = []
+            for idx_cluster in dict_clusters:
+                idxs_users += list(np.random.choice(list(dict_clusters[idx_cluster]), 1, replace=False))
+        else:
+            m = max(int(args.frac * args.num_users), 1)
+            idxs_users = np.random.choice(range(args.num_users), m, replace=False)
+
         for idx in idxs_users:
             local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
             w, loss = local.train(net=copy.deepcopy(net_glob).to(args.device))
