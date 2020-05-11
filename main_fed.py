@@ -16,6 +16,7 @@ import keras
 
 from utils.sampling import mnist_iid, mnist_noniid, cifar_iid, cifar_noniid
 from utils.options import args_parser
+from utils.lsh import LSHAlgo
 from models.Update import LocalUpdate
 from models.Nets import MLP, CNNMnist, CNNCifar
 from models.Fed import FedAvg
@@ -23,10 +24,15 @@ from models.test import test_img
 
 # keras.backend.set_image_data_format("channels_first")
 
-if __name__ == '__main__':
-    # parse args
-    args = args_parser()
-    args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
+
+user_feats = []
+
+# type of experiment:
+# - base:        general fed
+# - cluster:     base with cluster
+# - lsh-cluster: base with cluster & lsh
+def run_fed(args, type_exp = 'base'):
+    print('Current experiment type: ', type_exp)
 
     # load dataset and split users
     if args.dataset == 'mnist':
@@ -51,29 +57,43 @@ if __name__ == '__main__':
     img_size = dataset_train[0][0].shape
 
 
-    if args.num_clusters > 0:
+    dict_clusters = {}
+    if type_exp == 'cluster' or type_exp == 'lsh-cluster':
+        # feature map
         print('Featuring...')
         input_shape = (img_size[1], img_size[2], img_size[0])
         user_feats = []
         for idx_user in dict_users:
             print('User', idx_user, 'featuring...')
             user_images = [dataset_train[idx][0].numpy().swapaxes(0, 1).swapaxes(1, 2) for idx in dict_users[idx_user]]
-            model1 = keras.applications.vgg19.VGG19(include_top=False, weights="imagenet", input_shape=input_shape)
+            if args.feat_map == 'resnet50':
+                model1 = keras.applications.resnet.ResNet50(include_top=False, weights="imagenet", input_shape=input_shape)
+            elif args.feat_map == 'vgg19':
+                model1 = keras.applications.vgg19.VGG19(include_top=False, weights="imagenet", input_shape=input_shape)
+            else:
+                exit('Error: unrecognized keras application')
+            
             pred = model1.predict([user_images])
             feats = np.mean([data[0][0] for data in pred], axis=0)
             user_feats.append(feats)
-            
-        # 适当降维
-        print('PCA...')
-        pca = PCA(n_components=100, random_state=728)
-        pca_users = pca.fit_transform(user_feats)
+
+        if type_exp == 'lsh-cluster':
+            # 局部敏感哈希
+            print('LSH...')
+            lsh = LSHAlgo(feat_dim=len(user_feats[0]), code_dim=100) # code_dim: 输出维度
+            user_feats = [lsh.run(feats) for feats in user_feats]
+        else:
+            # 普通降维
+            print('PCA...')
+            # pca = PCA(n_components=2, random_state=728)
+            pca = PCA(n_components=50, random_state=728)
+            user_feats = pca.fit_transform(user_feats)
 
         # 聚类 users
         print('Clustering...')
         kmeans = KMeans(n_clusters=args.num_clusters, random_state=728)
-        kmeans.fit(pca_users)
+        kmeans.fit(user_feats)
 
-        dict_clusters = {}
         for idx_user, label in enumerate(kmeans.labels_):
             if label in dict_clusters:
                 dict_clusters[label].append(idx_user)
@@ -98,55 +118,89 @@ if __name__ == '__main__':
     print(net_glob)
     net_glob.train()
 
-    # copy weights
-    w_glob = net_glob.state_dict()
 
-    # training
-    loss_train = []
-    cv_loss, cv_acc = [], []
-    val_loss_pre, counter = 0, 0
-    net_best = None
-    best_loss = None
-    val_acc_list, net_list = [], []
+    # batch training
+    loss_train_list, acc_test_list = batch_train(type_exp, net_glob, dataset_train, dataset_test, dict_users, dict_clusters, args)
 
-    for iter in range(args.epochs):
-        w_locals, loss_locals = [], []
 
-        if args.num_clusters > 0:
-            # 预先聚类的情况
-            idxs_users = []
-            for idx_cluster in dict_clusters:
-                idxs_users += list(np.random.choice(list(dict_clusters[idx_cluster]), 1, replace=False))
-        else:
-            m = max(int(args.frac * args.num_users), 1)
-            idxs_users = np.random.choice(range(args.num_users), m, replace=False)
+    return loss_train_list, acc_test_list
 
-        for idx in idxs_users:
-            local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
-            w, loss = local.train(net=copy.deepcopy(net_glob).to(args.device))
-            w_locals.append(copy.deepcopy(w))
-            loss_locals.append(copy.deepcopy(loss))
-        # update global weights
-        w_glob = FedAvg(w_locals)
 
-        # copy weight to net_glob
-        net_glob.load_state_dict(w_glob)
+def batch_train(type_exp, net_glob, dataset_train, dataset_test, dict_users, dict_clusters, args):
+    loss_train_batch = []
+    acc_test_batch = []
 
-        # print loss
-        loss_avg = sum(loss_locals) / len(loss_locals)
-        print('Round {:3d}, Average loss {:.3f}'.format(iter, loss_avg))
-        loss_train.append(loss_avg)
+    for big_iter in range(args.iterations):
+        print('Iteration ', big_iter)
 
-    # plot loss curve
-    plt.figure()
-    plt.plot(range(len(loss_train)), loss_train)
-    plt.ylabel('train_loss')
-    plt.savefig('./save/fed_{}_{}_{}_C{}_iid{}.png'.format(args.dataset, args.model, args.epochs, args.frac, args.iid))
+        # copy weights
+        net_glob_copy = copy.deepcopy(net_glob)
+        w_glob = net_glob_copy.state_dict()
 
-    # testing
-    net_glob.eval()
-    acc_train, loss_train = test_img(net_glob, dataset_train, args)
-    acc_test, loss_test = test_img(net_glob, dataset_test, args)
-    print("Training accuracy: {:.2f}".format(acc_train))
-    print("Testing accuracy: {:.2f}".format(acc_test))
+        # training
+        loss_train = []
+        acc_test = []
 
+        for iter in range(args.epochs):
+            w_locals, loss_locals = [], []
+
+            if type_exp == 'cluster' or type_exp == 'lsh-cluster':
+                # 预先聚类的情况
+                idxs_users = []
+                for idx_cluster in dict_clusters:
+                    idxs_users += list(np.random.choice(list(dict_clusters[idx_cluster]), 1, replace=False))
+            else:
+                m = max(int(args.frac * args.num_users), 1)
+                idxs_users = np.random.choice(range(args.num_users), m, replace=False)
+
+            for idx in idxs_users:
+                local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
+                w, loss = local.train(net=copy.deepcopy(net_glob_copy).to(args.device))
+                w_locals.append(copy.deepcopy(w))
+                loss_locals.append(copy.deepcopy(loss))
+            # update global weights
+            w_glob = FedAvg(w_locals)
+
+            # copy weight to net_glob_copy
+            net_glob_copy.load_state_dict(w_glob)
+
+            # print loss & acc
+            loss_avg = sum(loss_locals) / len(loss_locals)
+            one_acc_test, one_loss_test = test_img(net_glob_copy, dataset_test, args)
+            print('Round {:3d}, Average loss {:.3f}, Test accuracy {:.3f}'.format(iter, loss_avg, one_acc_test))
+            loss_train.append(loss_avg)
+            acc_test.append(one_acc_test)
+
+        loss_train_batch.append(loss_train)
+        acc_test_batch.append(acc_test)
+
+    loss_train_avg = np.mean(loss_train_batch, axis=0)
+    acc_test_avg = np.mean(acc_test_batch, axis=0)
+    return loss_train_avg, acc_test_avg
+
+
+def plot(data, ylabel, args):
+    args = args_parser()
+    plt.figure()    
+    for label in data:
+        plt.plot(range(len(data[label])), data[label], label=label)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.savefig('./save/fed_{}_{}_{}_{}_{}_{}_iid{}.png'.format(args.type_exp, ylabel, args.dataset, args.model, args.iterations, args.epochs, args.iid))
+
+
+if __name__ == '__main__':
+    # parse args
+    args = args_parser()
+    args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
+
+    labels = ['base', 'cluster', 'lsh-cluster'] if args.type_exp == 'all' else [args.type_exp]
+    dict_train_loss = {}
+    dict_acc_test = {}
+    for label in labels:
+        dict_train_loss[label], dict_acc_test[label] = run_fed(args, label)
+
+    print(dict_train_loss, dict_acc_test)
+
+    plot(dict_train_loss, 'train_loss', args)
+    plot(dict_acc_test, 'test_acc', args)
