@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # Python version: 3.6
+import datetime
 
 import matplotlib
 matplotlib.use('Agg')
@@ -24,17 +25,13 @@ from models.test import test_img
 
 # keras.backend.set_image_data_format("channels_first")
 
-
+# cluster、lsh-cluster 共用
 user_feats = []
 
-# type of experiment:
-# - base:        general fed
-# - cluster:     base with cluster
-# - lsh-cluster: base with cluster & lsh
-def run_fed(args, type_exp = 'base'):
-    print('Current experiment type: ', type_exp)
 
+def load_dataset(args):
     # load dataset and split users
+    print('Loading dataset...')
     if args.dataset == 'mnist':
         trans_mnist = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
         dataset_train = datasets.MNIST('../data/mnist/', train=True, download=True, transform=trans_mnist)
@@ -51,48 +48,61 @@ def run_fed(args, type_exp = 'base'):
         if args.iid:
             dict_users = cifar_iid(dataset_train, args.num_users)
         else:
-            dict_users = cifar_noniid(dataset_train, args.num_users)
+            dict_users = cifar_noniid(dataset_train, args.num_users, case=args.noniid_case)
     else:
         exit('Error: unrecognized dataset')
-    img_size = dataset_train[0][0].shape
 
+    return dataset_train, dataset_test, dict_users
+
+
+# type of experiment:
+# - base:        general fed
+# - cluster:     base with cluster
+# - lsh-cluster: base with cluster & lsh
+def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
+    print('Current experiment type: ', type_exp)
+
+    img_size = dataset_train[0][0].shape
 
     dict_clusters = {}
     if type_exp == 'cluster' or type_exp == 'lsh-cluster':
         # feature map
         print('Featuring...')
         input_shape = (img_size[1], img_size[2], img_size[0])
-        user_feats = []
-        for idx_user in dict_users:
-            print('User', idx_user, 'featuring...')
-            user_images = [dataset_train[idx][0].numpy().swapaxes(0, 1).swapaxes(1, 2) for idx in dict_users[idx_user]]
-            if args.feat_map == 'resnet50':
-                model1 = keras.applications.resnet.ResNet50(include_top=False, weights="imagenet", input_shape=input_shape)
-            elif args.feat_map == 'vgg19':
-                model1 = keras.applications.vgg19.VGG19(include_top=False, weights="imagenet", input_shape=input_shape)
-            else:
-                exit('Error: unrecognized keras application')
-            
-            pred = model1.predict([user_images])
-            feats = np.mean([data[0][0] for data in pred], axis=0)
-            user_feats.append(feats)
+
+        if args.feat_map == 'resnet50':
+            model1 = keras.applications.resnet.ResNet50(include_top=False, weights="imagenet", input_shape=input_shape)
+        elif args.feat_map == 'vgg19':
+            model1 = keras.applications.vgg19.VGG19(include_top=False, weights="imagenet", input_shape=input_shape)
+        else:
+            exit('Error: unrecognized keras application')
+
+        if len(user_feats):
+            pass
+        else:
+            for idx_user in dict_users:
+                print('User', idx_user, 'featuring...')
+                user_images = [dataset_train[idx][0].numpy().swapaxes(0, 1).swapaxes(1, 2) for idx in dict_users[idx_user]]
+                
+                pred = model1.predict([user_images])
+                feats = np.mean([data[0][0] for data in pred], axis=0)
+                user_feats.append(feats)
 
         if type_exp == 'lsh-cluster':
             # 局部敏感哈希
             print('LSH...')
-            lsh = LSHAlgo(feat_dim=len(user_feats[0]), code_dim=100) # code_dim: 输出维度
-            user_feats = [lsh.run(feats) for feats in user_feats]
+            lsh = LSHAlgo(feat_dim=len(user_feats[0]), code_dim=512) # code_dim: 输出维度
+            user_feats1 = lsh.run(user_feats)
         else:
             # 普通降维
             print('PCA...')
-            # pca = PCA(n_components=2, random_state=728)
-            pca = PCA(n_components=50, random_state=728)
-            user_feats = pca.fit_transform(user_feats)
+            pca = PCA(n_components=args.pca_comps, random_state=728)
+            user_feats1 = pca.fit_transform(user_feats)
 
         # 聚类 users
         print('Clustering...')
         kmeans = KMeans(n_clusters=args.num_clusters, random_state=728)
-        kmeans.fit(user_feats)
+        kmeans.fit(user_feats1)
 
         for idx_user, label in enumerate(kmeans.labels_):
             if label in dict_clusters:
@@ -186,7 +196,7 @@ def plot(data, ylabel, args):
         plt.plot(range(len(data[label])), data[label], label=label)
     plt.ylabel(ylabel)
     plt.legend()
-    plt.savefig('./save/fed_{}_{}_{}_{}_{}_{}_iid{}.png'.format(args.type_exp, ylabel, args.dataset, args.model, args.iterations, args.epochs, args.iid))
+    plt.savefig('./save/fed_{}_{}_{}_{}_{}_{}_iid{}_{}.png'.format(args.type_exp, ylabel, args.dataset, args.model, args.iterations, args.epochs, args.iid, datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
 
 
 if __name__ == '__main__':
@@ -194,11 +204,15 @@ if __name__ == '__main__':
     args = args_parser()
     args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
 
+    # load dataset and split users
+    dataset_train, dataset_test, dict_users = load_dataset(args)
+
     labels = ['base', 'cluster', 'lsh-cluster'] if args.type_exp == 'all' else [args.type_exp]
+    # labels = ['cluster', 'lsh-cluster'] if args.type_exp == 'all' else [args.type_exp]
     dict_train_loss = {}
     dict_acc_test = {}
     for label in labels:
-        dict_train_loss[label], dict_acc_test[label] = run_fed(args, label)
+        dict_train_loss[label], dict_acc_test[label] = run_fed(args, dataset_train, dataset_test, dict_users, label)
 
     print(dict_train_loss, dict_acc_test)
 
