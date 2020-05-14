@@ -8,12 +8,12 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import copy
 import numpy as np
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms, models
 import torch
 from torch.utils.data import DataLoader
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-import keras
+from skimage import color   # lib: scikit-image
 
 from utils.sampling import mnist_iid, mnist_noniid, cifar_iid, cifar_noniid
 from utils.options import args_parser
@@ -22,8 +22,6 @@ from models.Update import LocalUpdate
 from models.Nets import MLP, CNNMnist, CNNCifar
 from models.Fed import FedAvg
 from models.test import test_img
-
-# keras.backend.set_image_data_format("channels_first")
 
 # cluster、lsh-cluster 共用
 user_feats = []
@@ -40,7 +38,7 @@ def load_dataset(args):
         if args.iid:
             dict_users = mnist_iid(dataset_train, args.num_users)
         else:
-            dict_users = mnist_noniid(dataset_train, args.num_users)
+            dict_users = mnist_noniid(dataset_train, args.num_users, case=args.noniid_case)
     elif args.dataset == 'cifar':
         trans_cifar = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
         dataset_train = datasets.CIFAR10('../data/cifar', train=True, download=True, transform=trans_cifar)
@@ -70,10 +68,8 @@ def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
         print('Featuring...')
         input_shape = (img_size[1], img_size[2], img_size[0])
 
-        if args.feat_map == 'resnet50':
-            model1 = keras.applications.resnet.ResNet50(include_top=False, weights="imagenet", input_shape=input_shape)
-        elif args.feat_map == 'vgg19':
-            model1 = keras.applications.vgg19.VGG19(include_top=False, weights="imagenet", input_shape=input_shape)
+        if args.feat_map == 'resnet18':
+            model = models.resnet18(pretrained=True)
         else:
             exit('Error: unrecognized keras application')
 
@@ -82,10 +78,14 @@ def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
         else:
             for idx_user in dict_users:
                 print('User', idx_user, 'featuring...')
-                user_images = [dataset_train[idx][0].numpy().swapaxes(0, 1).swapaxes(1, 2) for idx in dict_users[idx_user]]
-                
-                pred = model1.predict([user_images])
-                feats = np.mean([data[0][0] for data in pred], axis=0)
+                user_images = [dataset_train[idx][0].numpy() for idx in dict_users[idx_user]]
+                if args.dataset == 'mnist':
+                    user_images = [image[0] for image in color.gray2rgb(np.asarray(user_images, dtype=np.float32))]
+                    user_images = np.swapaxes(user_images, 1, 3)
+                    user_images = np.swapaxes(user_images, 2, 3)
+                    
+                pred = model(torch.Tensor(user_images))
+                feats = np.mean(pred.tolist(), axis=0)
                 user_feats.append(feats)
 
         if type_exp == 'lsh-cluster':
