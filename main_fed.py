@@ -130,10 +130,9 @@ def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
 
 
     # batch training
-    loss_train_list, acc_test_list = batch_train(type_exp, net_glob, dataset_train, dataset_test, dict_users, dict_clusters, args)
-
-
-    return loss_train_list, acc_test_list
+    if args.target_acc == 0:
+        return batch_train(type_exp, net_glob, dataset_train, dataset_test, dict_users, dict_clusters, args)
+    return batch_train_with_target_acc(type_exp, net_glob, dataset_train, dataset_test, dict_users, dict_clusters, args)
 
 
 def batch_train(type_exp, net_glob, dataset_train, dataset_test, dict_users, dict_clusters, args):
@@ -145,40 +144,14 @@ def batch_train(type_exp, net_glob, dataset_train, dataset_test, dict_users, dic
 
         # copy weights
         net_glob_copy = copy.deepcopy(net_glob)
-        w_glob = net_glob_copy.state_dict()
 
         # training
         loss_train = []
         acc_test = []
 
         for iter in range(args.epochs):
-            w_locals, loss_locals = [], []
-
-            if type_exp == 'cluster' or type_exp == 'lsh-cluster':
-                # 预先聚类的情况
-                idxs_users = []
-                for idx_cluster in dict_clusters:
-                    idxs_users += list(np.random.choice(list(dict_clusters[idx_cluster]), 1, replace=False))
-            else:
-                m = max(int(args.frac * args.num_users), 1)
-                idxs_users = np.random.choice(range(args.num_users), m, replace=False)
-
-            for idx in idxs_users:
-                local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
-                w, loss = local.train(net=copy.deepcopy(net_glob_copy).to(args.device))
-                w_locals.append(copy.deepcopy(w))
-                loss_locals.append(copy.deepcopy(loss))
-            # update global weights
-            w_glob = FedAvg(w_locals)
-
-            # copy weight to net_glob_copy
-            net_glob_copy.load_state_dict(w_glob)
-
-            # print loss & acc
-            loss_avg = sum(loss_locals) / len(loss_locals)
-            one_acc_test, one_loss_test = test_img(net_glob_copy, dataset_test, args)
-            print('Round {:3d}, Average loss {:.3f}, Test accuracy {:.3f}'.format(iter, loss_avg, one_acc_test))
-            loss_train.append(loss_avg)
+            one_loss_train, one_acc_test = train_one_round(iter, type_exp, net_glob_copy, dataset_train, dataset_test, dict_users, dict_clusters, args)
+            loss_train.append(one_loss_train)
             acc_test.append(one_acc_test)
 
         loss_train_batch.append(loss_train)
@@ -187,6 +160,59 @@ def batch_train(type_exp, net_glob, dataset_train, dataset_test, dict_users, dic
     loss_train_avg = np.mean(loss_train_batch, axis=0)
     acc_test_avg = np.mean(acc_test_batch, axis=0)
     return loss_train_avg, acc_test_avg
+
+
+def batch_train_with_target_acc(type_exp, net_glob, dataset_train, dataset_test, dict_users, dict_clusters, args):
+    round_batch = []
+    
+    for big_iter in range(args.iterations):
+        print('Iteration ', big_iter)
+
+        # copy weights
+        net_glob_copy = copy.deepcopy(net_glob)
+
+        # training
+        acc_test = float('-inf')
+        round = 0
+        while acc_test < args.target_acc:
+            loss_train, acc_test = train_one_round(round, type_exp, net_glob_copy, dataset_train, dataset_test, dict_users, dict_clusters, args)
+            round += 1
+        round_batch.append(round)
+
+    round_avg = np.mean(round_batch)
+
+    return round_avg, round_batch
+
+
+def train_one_round(iter, type_exp, net_glob, dataset_train, dataset_test, dict_users, dict_clusters, args):
+    w_locals, loss_locals = [], []
+
+    if type_exp == 'cluster' or type_exp == 'lsh-cluster':
+        # 预先聚类的情况
+        idxs_users = []
+        for idx_cluster in dict_clusters:
+            idxs_users += list(np.random.choice(list(dict_clusters[idx_cluster]), 1, replace=False))
+    else:
+        m = max(int(args.frac * args.num_users), 1)
+        idxs_users = np.random.choice(range(args.num_users), m, replace=False)
+
+    for idx in idxs_users:
+        local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
+        w, loss = local.train(net=copy.deepcopy(net_glob).to(args.device))
+        w_locals.append(copy.deepcopy(w))
+        loss_locals.append(copy.deepcopy(loss))
+    # update global weights
+    w_glob = FedAvg(w_locals)
+
+    # copy weight to net_glob_copy
+    net_glob.load_state_dict(w_glob)
+
+    # print loss & acc
+    loss_avg = sum(loss_locals) / len(loss_locals)
+    one_acc_test, one_loss_test = test_img(net_glob, dataset_test, args)
+    print('Round {:3d}, Average loss {:.3f}, Test accuracy {:.3f}'.format(iter, loss_avg, one_acc_test))
+
+    return loss_avg, one_acc_test
 
 
 def plot(data, ylabel, args):
@@ -208,13 +234,20 @@ if __name__ == '__main__':
     dataset_train, dataset_test, dict_users = load_dataset(args)
 
     labels = ['base', 'cluster', 'lsh-cluster'] if args.type_exp == 'all' else [args.type_exp]
-    # labels = ['cluster', 'lsh-cluster'] if args.type_exp == 'all' else [args.type_exp]
-    dict_train_loss = {}
-    dict_acc_test = {}
-    for label in labels:
-        dict_train_loss[label], dict_acc_test[label] = run_fed(args, dataset_train, dataset_test, dict_users, label)
 
-    print(dict_train_loss, dict_acc_test)
+    if args.target_acc == 0:
+        dict_train_loss = {}
+        dict_acc_test = {}
+        for label in labels:
+            dict_train_loss[label], dict_acc_test[label] = run_fed(args, dataset_train, dataset_test, dict_users, label)
 
-    plot(dict_train_loss, 'train_loss', args)
-    plot(dict_acc_test, 'test_acc', args)
+        print(dict_train_loss, dict_acc_test)
+
+        plot(dict_train_loss, 'train_loss', args)
+        plot(dict_acc_test, 'test_acc', args)
+    else:
+        for label in labels:
+            round_avg, round_batch = run_fed(args, dataset_train, dataset_test, dict_users, label)
+            print('{}, average round: {}'.format(label, round_avg))
+            print(round_batch)
+    
