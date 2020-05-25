@@ -42,7 +42,7 @@ def args_parser():
     parser.add_argument('--seed', type=int, default=1, help='random seed (default: 1)')
     parser.add_argument('--iterations', type=int, default=10, help="iterations of training")
     parser.add_argument('--type_exp', type=str, default='all', help="type of experiment ('all', 'base', 'cluster', 'lsh-cluster')")
-    parser.add_argument('--feat_map', type=str, default='resnet18', help="'resnet50', 'vgg19'")
+    parser.add_argument('--feat_map', type=str, default='resnet50', help="'resnet50', 'vgg19'")
     parser.add_argument('--pca_comps', type=int, default=50, help="number of pca components")
     parser.add_argument('--noniid_case', type=int, default=1, help="non i.i.d case (1, 2, 3, 4)")
 

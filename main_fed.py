@@ -13,9 +13,10 @@ import torch
 from torch.utils.data import DataLoader
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
-from skimage import color   # lib: scikit-image
+from skimage import color, transform   # lib: scikit-image
+import keras
 
-from utils.sampling import mnist_iid, mnist_noniid, cifar_iid, cifar_noniid
+from utils.sampling import mnist_iid, mnist_noniid, cifar_iid, cifar_noniid, fashion_mnist_iid, fashion_mnist_noniid
 from utils.options import args_parser
 from utils.lsh import LSHAlgo
 from models.Update import LocalUpdate
@@ -39,6 +40,14 @@ def load_dataset(args):
             dict_users = mnist_iid(dataset_train, args.num_users)
         else:
             dict_users = mnist_noniid(dataset_train, args.num_users, case=args.noniid_case)
+    elif args.dataset == 'fashion-mnist':
+        trans = transforms.Compose([transforms.ToTensor()])
+        dataset_train = datasets.FashionMNIST('../data/fashion-mnist/', train=True, download=True, transform=trans)
+        dataset_test = datasets.FashionMNIST('../data/fashion-mnist/', train=False, download=True, transform=trans)
+        if args.iid:
+            dict_users = fashion_mnist_iid(dataset_train, args.num_users)
+        else:
+            dict_users = fashion_mnist_noniid(dataset_train, args.num_users, case=args.noniid_case)
     elif args.dataset == 'cifar':
         trans_cifar = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
         dataset_train = datasets.CIFAR10('../data/cifar', train=True, download=True, transform=trans_cifar)
@@ -47,6 +56,15 @@ def load_dataset(args):
             dict_users = cifar_iid(dataset_train, args.num_users)
         else:
             dict_users = cifar_noniid(dataset_train, args.num_users, case=args.noniid_case)
+    # elif args.dataset == 'svhn':
+    #     trans = transforms.Compose([transforms.ToTensor()])
+    #     dataset_train = datasets.SVHN('../data/svhn/', split='train', download=True, transform=trans)
+    #     dataset_test = datasets.SVHN('../data/svhn/', split='test', download=True, transform=trans)
+    #     print(len(dataset_train))
+    #     if args.iid:
+    #         dict_users = svhn_iid(dataset_train, args.num_users)
+    #     else:
+    #         dict_users = svhn_noniid(dataset_train, args.num_users, case=args.noniid_case)
     else:
         exit('Error: unrecognized dataset')
 
@@ -66,10 +84,12 @@ def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
     if type_exp == 'cluster' or type_exp == 'lsh-cluster':
         # feature map
         print('Featuring...')
-        input_shape = (img_size[1], img_size[2], img_size[0])
+        input_shape = (max(img_size[1], 32), max(img_size[2], 32), max(img_size[0], 3))
 
-        if args.feat_map == 'resnet18':
-            model = models.resnet18(pretrained=True)
+        if args.feat_map == 'resnet50':
+            model1 = keras.applications.resnet.ResNet50(include_top=False, weights="imagenet", input_shape=input_shape)
+        elif args.feat_map == 'vgg19':
+            model1 = keras.applications.vgg19.VGG19(include_top=False, weights="imagenet", input_shape=input_shape)
         else:
             exit('Error: unrecognized keras application')
 
@@ -78,14 +98,20 @@ def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
         else:
             for idx_user in dict_users:
                 print('User', idx_user, 'featuring...')
-                user_images = [dataset_train[idx][0].numpy() for idx in dict_users[idx_user]]
-                if args.dataset == 'mnist':
-                    user_images = [image[0] for image in color.gray2rgb(np.asarray(user_images, dtype=np.float32))]
-                    user_images = np.swapaxes(user_images, 1, 3)
+                user_images = []
+                for idx in dict_users[idx_user]:
+                    image = dataset_train[idx][0].numpy()
+                    if args.dataset in ['mnist', 'fashion-mnist']:
+                        image = color.gray2rgb(image)[0]
+                        image = transform.resize(image, (32, 32))
+                    user_images.append(image)
+
+                if args.dataset not in ['mnist', 'fashion-mnist']:
+                    user_images = np.swapaxes(user_images, 1, 2)
                     user_images = np.swapaxes(user_images, 2, 3)
                     
-                pred = model(torch.Tensor(user_images))
-                feats = np.mean(pred.tolist(), axis=0)
+                pred = model1.predict([user_images])
+                feats = np.mean([data[0][0] for data in pred], axis=0)
                 user_feats.append(feats)
 
         if type_exp == 'lsh-cluster':

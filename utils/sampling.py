@@ -7,51 +7,42 @@ import numpy as np
 from torchvision import datasets, transforms
 
 def mnist_iid(dataset, num_users):
-    """
-    Sample I.I.D. client data from MNIST dataset
-    :param dataset:
-    :param num_users:
-    :return: dict of image index
-    """
-    num_items = int(len(dataset)/num_users)
-    dict_users, all_idxs = {}, [i for i in range(len(dataset))]
-    for i in range(num_users):
-        dict_users[i] = set(np.random.choice(all_idxs, num_items, replace=False))
-        all_idxs = list(set(all_idxs) - dict_users[i])
-    return dict_users
+    return iid(dataset, num_users)
 
 
 def mnist_noniid(dataset, num_users, case = 1):
-    """
-    Sample non-I.I.D client data from MNIST dataset
-    :param dataset:
-    :param num_users:
-    :return:
-    """
     num_shards, num_imgs = 100, 600
-    if case == 1:
-        # 每个 user 只有 1 类
-        return noniid_ratio_r_label_1(dataset, num_users, num_shards, num_imgs)
-    elif case == 2:
-        # 每个 user 中只有 2 类
-        return noniid_label_2(dataset, num_users, 200, 300)
-    elif case == 3:
-        # 每个 user 中，80% 属于 1 类，20% 属于其他类
-        return noniid_ratio_r_label_1(dataset, num_users, num_shards, num_imgs, ratio = 0.8)
-    elif case == 4:
-        # 每个 user 中，50% 属于 1 类，50% 属于其他类
-        return noniid_ratio_r_label_1(dataset, num_users, num_shards, num_imgs, ratio = 0.5)
-    else:
-         exit('Error: unrecognized noniid case')
+    return non_iid(dataset, num_users, num_shards, num_imgs, case)
+
+
+def fashion_mnist_iid(dataset, num_users):
+    return iid(dataset, num_users)
+
+
+def fashion_mnist_noniid(dataset, num_users, case = 1):
+    num_shards, num_imgs = 100, 600
+    return non_iid(dataset, num_users, num_shards, num_imgs, case)
 
 
 def cifar_iid(dataset, num_users):
-    """
-    Sample I.I.D. client data from CIFAR10 dataset
-    :param dataset:
-    :param num_users:
-    :return: dict of image index
-    """
+    return iid(dataset, num_users)
+
+
+def cifar_noniid(dataset, num_users, case = 1):
+    num_shards, num_imgs = 100, 500
+    return non_iid(dataset, num_users, num_shards, num_imgs, case)
+
+
+def svhn_iid(dataset, num_users):
+    return iid(dataset, num_users)
+
+
+def svhn_noniid(dataset, num_users, case = 1):
+    num_shards, num_imgs = 100, 700
+    return non_iid(dataset, num_users, num_shards, num_imgs, case)
+
+
+def iid(dataset, num_users):
     num_items = int(len(dataset)/num_users)
     dict_users, all_idxs = {}, [i for i in range(len(dataset))]
     for i in range(num_users):
@@ -59,20 +50,14 @@ def cifar_iid(dataset, num_users):
         all_idxs = list(set(all_idxs) - dict_users[i])
     return dict_users
 
-def cifar_noniid(dataset, num_users, case = 1):
-    """
-    Sample non-I.I.D client data from CIFAR dataset
-    :param dataset:
-    :param num_users:
-    :return:
-    """
-    num_shards, num_imgs = 100, 500
+
+def non_iid(dataset, num_users, num_shards, num_imgs, case = 1):
     if case == 1:
         # 每个 user 只有 1 类
         return noniid_ratio_r_label_1(dataset, num_users, num_shards, num_imgs)
     elif case == 2:
         # 每个 user 中只有 2 类
-        return noniid_label_2(dataset, num_users, 200, 250)
+        return noniid_label_2(dataset, num_users, int(num_shards * 2), int(num_imgs / 2))
     elif case == 3:
         # 每个 user 中，80% 属于 1 类，20% 属于其他类
         return noniid_ratio_r_label_1(dataset, num_users, num_shards, num_imgs, ratio = 0.8)
@@ -85,7 +70,6 @@ def cifar_noniid(dataset, num_users, case = 1):
 
 # 每个 user 中，[ratio] 比例属于一类
 def noniid_ratio_r_label_1(dataset, num_users, num_shards, num_imgs, ratio = 1):
-    # num_shards, num_imgs = 100, 500
     idx_shard = [i for i in range(num_shards)]
     dict_users = {i: np.array([], dtype='int64') for i in range(num_users)}
     idxs = np.arange(num_shards*num_imgs)
@@ -142,12 +126,16 @@ def noniid_label_2(dataset, num_users, num_shards, num_imgs):
 
 if __name__ == '__main__':
     # 如果需要验证 non-iid 的处理是否正确，跑一下可以直观看到
-    trans_mnist = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
-    dataset_train = datasets.MNIST('../data/mnist/', train=True, download=True, transform=trans_mnist)
+    trans = transforms.Compose([transforms.ToTensor()])
+    dataset_train = datasets.SVHN('../data/svhn/', split='train', download=True, transform=trans)
+    # trans = transforms.Compose([transforms.ToTensor()])
+    # dataset_train = datasets.FashionMNIST('../data/fashion-mnist/', train=True, download=True, transform=trans)
+    # trans_mnist = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+    # dataset_train = datasets.MNIST('../data/mnist/', train=True, download=True, transform=trans_mnist)
     # trans_cifar = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
     # dataset_train = datasets.CIFAR10('../data/cifar', train=True, download=True, transform=trans_cifar)
     num = 100
-    d = mnist_noniid(dataset_train, num, 3)
+    d = svhn_noniid(dataset_train, num)
     for user_idx in d:
         print(user_idx)
         print([dataset_train[img_idx][1] for img_idx in d[user_idx]])
