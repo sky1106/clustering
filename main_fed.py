@@ -15,12 +15,12 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from skimage import color, transform   # lib: scikit-image
 import keras
-
+from threading import Thread
 from utils.sampling import mnist_iid, mnist_noniid, cifar_iid, cifar_noniid, fashion_mnist_iid, fashion_mnist_noniid
 from utils.options import args_parser
 from utils.lsh import LSHAlgo
 from models.Update import LocalUpdate
-from models.Nets import MLP, CNNMnist, CNNCifar
+from models.Nets import MLP, CNNMnist, CNNCifar, CNNFashionMnist
 from models.Fed import FedAvg
 from models.test import test_img
 
@@ -31,6 +31,7 @@ user_feats = []
 def load_dataset(args):
     # load dataset and split users
     print('Loading dataset...')
+    print(args.verbose)
     if args.dataset == 'mnist':
         trans_mnist = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
         dataset_train = datasets.MNIST('../data/mnist/', train=True, download=True, transform=trans_mnist)
@@ -75,7 +76,7 @@ def load_dataset(args):
 # - base:        general fed
 # - cluster:     base with cluster
 # - lsh-cluster: base with cluster & lsh
-def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
+def run_fed(args, dataset_train, dataset_test, dict_users, num_clusters, code_dim, type_exp = 'base'):
     print('Current experiment type: ', type_exp)
 
     img_size = dataset_train[0][0].shape
@@ -117,7 +118,7 @@ def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
         if type_exp == 'lsh-cluster':
             # 局部敏感哈希
             print('LSH...')
-            lsh = LSHAlgo(feat_dim=len(user_feats[0]), code_dim=512) # code_dim: 输出维度
+            lsh = LSHAlgo(feat_dim=len(user_feats[0]), code_dim=code_dim) # code_dim: 输出维度
             user_feats1 = lsh.run(user_feats)
         else:
             # 普通降维
@@ -127,7 +128,7 @@ def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
 
         # 聚类 users
         print('Clustering...')
-        kmeans = KMeans(n_clusters=args.num_clusters, random_state=728)
+        kmeans = KMeans(n_clusters=num_clusters, random_state=728)
         kmeans.fit(user_feats1)
 
         for idx_user, label in enumerate(kmeans.labels_):
@@ -144,6 +145,8 @@ def run_fed(args, dataset_train, dataset_test, dict_users, type_exp = 'base'):
         net_glob = CNNCifar(args=args).to(args.device)
     elif args.model == 'cnn' and args.dataset == 'mnist':
         net_glob = CNNMnist(args=args).to(args.device)
+    elif args.model == 'cnn' and args.dataset == 'fashion-mnist':
+        net_glob = CNNFashionMnist(args=args).to(args.device)
     elif args.model == 'mlp':
         len_in = 1
         for x in img_size:
@@ -185,7 +188,11 @@ def batch_train(type_exp, net_glob, dataset_train, dataset_test, dict_users, dic
 
     loss_train_avg = np.mean(loss_train_batch, axis=0)
     acc_test_avg = np.mean(acc_test_batch, axis=0)
-    return loss_train_avg, acc_test_avg
+
+    loss_train_std = np.std(loss_train_batch, axis=0)
+    acc_test_std = np.std(acc_test_batch, axis=0)
+
+    return loss_train_avg, acc_test_avg, loss_train_std, acc_test_std
 
 
 def batch_train_with_target_acc(type_exp, net_glob, dataset_train, dataset_test, dict_users, dict_clusters, args):
@@ -222,11 +229,16 @@ def train_one_round(iter, type_exp, net_glob, dataset_train, dataset_test, dict_
         m = max(int(args.frac * args.num_users), 1)
         idxs_users = np.random.choice(range(args.num_users), m, replace=False)
 
-    for idx in idxs_users:
-        local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
-        w, loss = local.train(net=copy.deepcopy(net_glob).to(args.device))
-        w_locals.append(copy.deepcopy(w))
-        loss_locals.append(copy.deepcopy(loss))
+    threads = [Thread(target=train_single, args = (args, dataset_train, dict_users, idx, net_glob, w_locals, loss_locals)) for idx in idxs_users]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+
+
+    # for idx in idxs_users:
+    #     train_single(args, dataset_train, dict_users, idx, net_glob, w_locals, loss_locals)
+
+
+
     # update global weights
     w_glob = FedAvg(w_locals)
 
@@ -240,40 +252,165 @@ def train_one_round(iter, type_exp, net_glob, dataset_train, dataset_test, dict_
 
     return loss_avg, one_acc_test
 
+def train_single(args, dataset_train, dict_users, idx, net_glob, w_locals, loss_locals):
+    local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
+    w, loss = local.train(net=copy.deepcopy(net_glob).to(args.device))
+    w_locals.append(copy.deepcopy(w))
+    loss_locals.append(copy.deepcopy(loss))
 
-def plot(data, ylabel, args):
+
+def plot(data, data_std, ylabel, args):
+    print("##############into plot#############")
     args = args_parser()
     plt.figure()    
+    # colour = ['darkblue','darkred','darkgreen','black','darkmagenta','darkorange','darkcyan']
+    # ecolour = ['cornflowerblue','lightcoral','lightgreen','gray','magenta','bisque','cyan']
+    # i = 0
     for label in data:
-        plt.plot(range(len(data[label])), data[label], label=label)
+        if args.plot_std:
+            plt.errorbar(range(len(data[label])), data[label], yerr=data_std[label], label=label, elinewidth=1)
+        else:
+            plt.plot(range(len(data[label])), data[label], label=label)
+        # i = i + 1
     plt.ylabel(ylabel)
     plt.legend()
-    plt.savefig('./save/fed_{}_{}_{}_{}_{}_{}_iid{}_{}.png'.format(args.type_exp, ylabel, args.dataset, args.model, args.iterations, args.epochs, args.iid, datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
+    plt.savefig('./output/fed_{}_{}_{}_{}_{}_{}_{}_iid{}_{}.pdf'.format(args.type_exp, ylabel, args.dataset, args.model, args.noniid_case, args.iterations, args.epochs, args.iid, datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")))
+
+def save_result(data, ylabel, args):
+    with open(r'./test/{}_{}_{}_{}_{}_{}_{}_iid{}_{}.txt'.format(args.type_exp, ylabel, args.dataset, args.model, args.noniid_case, args.iterations, args.epochs, args.iid, datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")), 'a') as f:
+        for label in data:
+            f.write(label)
+            f.write(' ')
+            for item in data[label]:
+                item1 = str(item)
+                f.write(item1)
+                f.write(' ')
+            f.write('\n')
+    print('save finished')
+    f.close()
 
 
 if __name__ == '__main__':
     # parse args
+    print('begin time: ', datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
     args = args_parser()
     args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
 
-    # load dataset and split users
-    dataset_train, dataset_test, dict_users = load_dataset(args)
 
-    labels = ['base', 'cluster', 'lsh-cluster'] if args.type_exp == 'all' else [args.type_exp]
+    if args.multi_plot_case == 0:
+        # Case 0:
+        # 默认作图
 
-    if args.target_acc == 0:
+         # load dataset and split users
+        dataset_train, dataset_test, dict_users = load_dataset(args)
+
+        labels = ['base', 'cluster', 'lsh-cluster'] if args.type_exp == 'all' else [args.type_exp]
+
+        if args.target_acc == 0:
+            dict_train_loss = {}
+            dict_acc_test = {}
+            dict_std_train_loss = {}
+            dict_std_acc_test = {}
+            for label in labels:
+                dict_train_loss[label], dict_acc_test[label], dict_std_train_loss[label], dict_std_acc_test[label] = run_fed(
+                    args, dataset_train, dataset_test, dict_users, args.num_clusters, args.code_dim, type_exp = label
+                )
+
+            print(dict_train_loss, dict_acc_test)
+
+            save_result(dict_train_loss, 'train_loss', args)
+            save_result(dict_acc_test, 'test_acc', args)
+            plot(dict_train_loss, dict_std_train_loss, 'train_loss', args)
+            plot(dict_acc_test, dict_std_acc_test, 'test_acc', args)
+        else:
+            for label in labels:
+                round_avg, round_batch = run_fed(args, dataset_train, dataset_test, dict_users, args.num_clusters, args.code_dim, label)
+                print('{}, average round: {}'.format(label, round_avg))
+                print(round_batch)
+    
+
+    elif args.multi_plot_case == 1:
+        # Case 1:
+        # - base
+        # - 几种 num_clusters 的 lsh-cluster
+        # - 几种 num_clusters 的 cluster
+        dataset_train, dataset_test, dict_users = load_dataset(args)
+
+        list_num_clusters = [10, 20, 50]  # <- 改这里
+
+        plot_list = [
+            { 'type_exp': 'base'}
+        ] + [
+            { 'type_exp': 'lsh-cluster', 'num_clusters': num } for num in list_num_clusters
+        ] + [
+            { 'type_exp': 'cluster', 'num_clusters': num } for num in list_num_clusters
+        ]
+
         dict_train_loss = {}
         dict_acc_test = {}
-        for label in labels:
-            dict_train_loss[label], dict_acc_test[label] = run_fed(args, dataset_train, dataset_test, dict_users, label)
+        dict_std_train_loss = {}
+        dict_std_acc_test = {}
 
-        print(dict_train_loss, dict_acc_test)
+        for p in plot_list:
+            if 'num_clusters' in p:
+                label = '{}: num_clusters={}'.format(p['type_exp'], p['num_clusters'])
+            else:
+                label = p['type_exp']
+            dict_train_loss[label], dict_acc_test[label], dict_std_train_loss[label], dict_std_acc_test[label] = run_fed(
+                args,
+                dataset_train,
+                dataset_test,
+                dict_users,
+                p['num_clusters'] if 'num_clusters' in p else 0,
+                args.code_dim,
+                type_exp = p['type_exp']
+            )
+        print(dict_acc_test, dict_std_acc_test)
+        plot(dict_acc_test, dict_std_acc_test, 'test_acc', args)
 
-        plot(dict_train_loss, 'train_loss', args)
-        plot(dict_acc_test, 'test_acc', args)
-    else:
-        for label in labels:
-            round_avg, round_batch = run_fed(args, dataset_train, dataset_test, dict_users, label)
-            print('{}, average round: {}'.format(label, round_avg))
-            print(round_batch)
-    
+
+    elif args.multi_plot_case == 2:
+        # Case 2:
+        # - base
+        # - 几种 code_dim 的 lsh-cluster
+        dataset_train, dataset_test, dict_users = load_dataset(args)
+
+        list_code_dim = [100, 200, 512]  # <- 改这里
+
+        plot_list = [
+            { 'type_exp': 'base' }
+        ] + [
+            { 'type_exp': 'lsh-cluster', 'code_dim': dim } for dim in list_code_dim
+        ]
+
+        dict_train_loss = {}
+        dict_acc_test = {}
+        dict_std_train_loss = {}
+        dict_std_acc_test = {}
+
+        for p in plot_list:
+            if 'code_dim' in p:
+                label = '{}: code_dim={}'.format(p['type_exp'], p['code_dim'])
+            else:
+                label = p['type_exp']
+            dict_train_loss[label], dict_acc_test[label], dict_std_train_loss[label], dict_std_acc_test[label] = run_fed(
+                args,
+                dataset_train,
+                dataset_test,
+                dict_users,
+                args.num_clusters,
+                p['code_dim'] if 'code_dim' in p else 0,
+                type_exp = p['type_exp']
+            )
+        print(dict_acc_test, dict_std_acc_test)
+        plot(dict_acc_test, dict_std_acc_test, 'test_acc', args)
+
+
+    elif args.multi_plot_case == 3:
+        # Case 2:
+        # - 几种 num_users 的 base
+        # - 几种 num_users 的 cluster
+        # - 几种 num_users 的 lsh-cluster
+        pass
+
+    print('end time: ', datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
